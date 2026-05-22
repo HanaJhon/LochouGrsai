@@ -5,6 +5,11 @@ import axios from "axios";
 import FormData from "form-data";
 import { createServer as createViteServer } from "vite";
 import fs from "fs";
+import http from "http";
+import https from "https";
+
+const httpAgent = new http.Agent({ keepAlive: true, timeout: 1800000 });
+const httpsAgent = new https.Agent({ keepAlive: true, timeout: 1800000 });
 
 // Local log recorder
 function logToFile(msg: string) {
@@ -76,6 +81,12 @@ async function startServer() {
 
       // Resolve endpoint URL and key
       let targetUrl = custom_api_url || process.env.EXTERNAL_API_URL || "https://grsaiapi.com/v1/api/generate";
+      if (targetUrl) {
+        targetUrl = targetUrl.replace(/\/$/, '');
+        if (!targetUrl.includes('/v1/api/')) {
+          targetUrl += '/v1/api/generate';
+        }
+      }
       const apiKey = custom_api_key || process.env.EXTERNAL_API_KEY;
 
       const files = (req.files as any[]) || [];
@@ -89,10 +100,16 @@ async function startServer() {
       logToFile(`API Key length: ${apiKey ? apiKey.length : 0} (starts with Bearer: ${apiKey ? apiKey.startsWith('Bearer ') : false})`);
       logToFile(`Attached images: ${files.length}`);
 
-      // Configure headers for streaming/heartbeat to satisfy proxies
+      // Configure headers for streaming/heartbeat to satisfy proxies and CDN buffering
       res.setHeader('Content-Type', 'application/json');
       res.setHeader('Transfer-Encoding', 'chunked');
       res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Accel-Buffering', 'no'); // Disable NGINX content buffering
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Connection', 'keep-alive');
+
+      // Flush headers immediately onto the socket to secure connection status
+      res.flushHeaders();
 
       heartbeatInterval = setInterval(() => {
         try {
@@ -188,10 +205,27 @@ async function startServer() {
           }
         }
 
+        let resolvedModel = model || '';
+        let wasRoutedFor4K = false;
+        
+        // Automatic routing for 4K resolutions on models that only support 1K/2K
+        if (resolution === '4K') {
+          if (resolvedModel.includes('banana') || resolvedModel === 'gpt-image-2') {
+            resolvedModel = 'gpt-image-2-vip';
+            wasRoutedFor4K = true;
+            logToFile(`Routing model [${model}] with resolution 4K to [gpt-image-2-vip] to guarantee true 4K ultra-high-definition output dimensions.`);
+          }
+        } else if (files.length > 0 && resolvedModel === 'gpt-image-2') {
+          resolvedModel = 'gpt-image-2-vip';
+          logToFile(`Routing model [gpt-image-2] with image uploads to [gpt-image-2-vip] to ensure stable Image-to-Image merging and resolve high-latency upstream issues.`);
+        }
+
+        const isBananaModel = resolvedModel?.includes('banana');
+
         // For VIP and Banana models, force aspect_ratio to be the resolved pixel dimension string (e.g. '1024x1024')
         // since these models do not support ratio strings directly.
         let finalAspectRatioField = resolvedRatio;
-        if (model === 'gpt-image-2-vip' || model?.includes('vip') || model?.includes('banana')) {
+        if (!isBananaModel && (resolvedModel === 'gpt-image-2-vip' || resolvedModel?.includes('vip'))) {
           finalAspectRatioField = resolvedSize || aspect_ratio;
           logToFile(`Forcing aspect_ratio field to pixel dimensions: ${finalAspectRatioField}`);
         }
@@ -208,23 +242,23 @@ async function startServer() {
 
         // ALWAYS send as clean JSON with Base64 arrays since Grsai API expects JSON format
         const apiPayload: any = {
-          model: model || '',
+          model: resolvedModel,
           prompt: prompt || '',
           
           // Ratio formats OR Forced Pixel sizes depending on model VIP requirements
-          aspect_ratio: finalAspectRatioField || '',
-          aspectRatio: finalAspectRatioField || '',
+          aspect_ratio: isBananaModel ? (aspect_ratio || '1:1') : (finalAspectRatioField || ''),
+          aspectRatio: isBananaModel ? (aspect_ratio || '1:1') : (finalAspectRatioField || ''),
           
           // Image Dimension formats (e.g. '2880x2880', '1K')
-          resolution: resolvedSize || '',
-          imageSize: resolvedSize || '',
-          image_size: resolvedSize || '',
-          size: resolvedSize || '',
+          resolution: resolvedSize || resolution || '1K',
+          imageSize: resolvedSize || resolution || '1K',
+          image_size: resolvedSize || resolution || '1K',
+          size: resolvedSize || resolution || '1K',
           
           // Explicit width and height constraints
           width: width,
           height: height,
-          width_height: resolvedSize || '',
+          width_height: isBananaModel ? (resolution || '1K') : (resolvedSize || ''),
           
           // Raw originals for strict compliance checking
           raw_aspect_ratio: aspect_ratio || '',
@@ -271,7 +305,10 @@ async function startServer() {
           },
           maxContentLength: Infinity,
           maxBodyLength: Infinity,
-          validateStatus: () => true, 
+          validateStatus: () => true,
+          httpAgent,
+          httpsAgent,
+          timeout: 1800000, // 30 minutes timeout
         });
       } catch (postError: any) {
         if (heartbeatInterval) {
@@ -449,9 +486,14 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
   });
+
+  // Set generous timeout boundaries to accommodate long image generation without dropping connections
+  server.timeout = 1800000; // 30 minutes
+  server.keepAliveTimeout = 600000; // 10 minutes
+  server.headersTimeout = 610000; // 10 minutes + 10s margin as recommended by Node.js docs
 }
 
 startServer();

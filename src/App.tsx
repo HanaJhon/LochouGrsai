@@ -421,27 +421,102 @@ export default function App() {
         });
       }
 
-      const response = await fetch('/api/generate', {
-        method: 'POST',
-        body: formData,
-      });
+      let response: Response | null = null;
+      let trimmedText = "";
+      let contentType = "";
+      let attempts = 0;
+      const maxAttempts = 4;
+
+      while (attempts < maxAttempts) {
+        attempts++;
+        try {
+          if (attempts > 1) {
+            addLog(`任务 [${task.id.slice(-4)}] 遇到网络短暂延迟或断连，正在第 ${attempts}/${maxAttempts} 次自动尝试重置连接...`, 'info');
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          }
+
+          response = await fetch('/api/generate', {
+            method: 'POST',
+            body: formData,
+          });
+
+          contentType = response.headers.get("content-type") || "";
+
+          // Actively consume the stream chunk by chunk from connection socket to prevent idle sweeps
+          if (response.body && typeof response.body.getReader === 'function') {
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder("utf-8");
+            let done = false;
+            let accumulated = "";
+            
+            while (!done) {
+              const { value, done: readerDone } = await reader.read();
+              done = readerDone;
+              if (value) {
+                accumulated += decoder.decode(value, { stream: !done });
+              }
+            }
+            trimmedText = accumulated.trim();
+          } else {
+            const text = await response.text();
+            trimmedText = text.trim();
+          }
+
+          const isHtml = trimmedText.startsWith('<!doctype html') || trimmedText.startsWith('<!DOCTYPE html') || contentType.includes("text/html");
+
+          if (isHtml) {
+            if (attempts < maxAttempts) {
+              continue; // Autoretry on HTML gateways (typically shown during server reloads)
+            }
+            if (response.status === 504) {
+              throw new Error("网关超时 (HTTP 504 Gateway Timeout)。图片在线生成耗时较长（通常超过 60 秒），已被云端网关强制断开。建议您降低分辨率（例如设为 1K） or 更换其他轻量模型重试！");
+            } else if (response.status === 502) {
+              throw new Error("网关错误 (HTTP 502 Bad Gateway)。后端服务暂时无响应、或者由于代码热重载正在编译重启中。请无需担心，稍等 3-5 秒后再次点击生成即可成功！");
+            } else if (response.status === 404) {
+              throw new Error("接口未找到 (HTTP 404 Not Found)。请确保您的后端服务接口完整且正在运行，或稍后再试。");
+            } else {
+              throw new Error(`后端服务暂时繁忙，网关返回了网页响应 (HTTP ${response.status})。这通常发生在服务崩溃、热更新重启中或网关限流超时。在多次自动重试后依然失败，请稍等 3 秒后再次点击「生成图片」重试！`);
+            }
+          }
+
+          // Successfully obtained JSON/proper response. Exit retry loop.
+          break;
+
+        } catch (runError: any) {
+          const runErrStr = runError && runError.message ? runError.message : String(runError);
+          const errLower = runErrStr.toLowerCase();
+          const isNetworkError = 
+            errLower.includes('fetch') || 
+            errLower.includes('network') || 
+            errLower.includes('aborted') || 
+            errLower.includes('load failed') || 
+            errLower.includes('timeout') || 
+            runError.name === 'TypeError';
+
+          if (isNetworkError && attempts < maxAttempts) {
+            continue; // Autoretry on network connection dropouts
+          }
+          throw runError;
+        }
+      }
+
+      if (!response) {
+        throw new Error("未能成功建立与后端生成服务器的连接。");
+      }
 
       const endTime = Date.now();
       const duration = ((endTime - startTime) / 1000).toFixed(2);
       clearInterval(progressInterval);
 
-      const contentType = response.headers.get("content-type");
       let responseData: any;
-      const text = await response.text();
-
       if (contentType && contentType.includes("application/json")) {
         try {
-          responseData = JSON.parse(text.trim());
+          responseData = JSON.parse(trimmedText);
         } catch (e) {
-          throw new Error(`Server returned invalid JSON structure [${response.status}]. Code: ${text.slice(0, 150)}`);
+          throw new Error(`服务器返回了不规范的数据结构 [${response.status}]。内容预览: ${trimmedText.slice(0, 150)}`);
         }
       } else {
-        throw new Error(`Server returned non-JSON [${response.status}]. Type: ${contentType}. Code: ${text.slice(0, 150)}`);
+        throw new Error(`服务器返回了非JSON响应 [${response.status}]。类型: ${contentType || '未知'}。内容预览: ${trimmedText.slice(0, 150)}`);
       }
 
       // Check for errors embedded in streamed JSON response even if status was ok
@@ -482,8 +557,25 @@ export default function App() {
     } catch (error: any) {
       clearInterval(progressInterval);
       console.error(error);
-      updateTask({ status: 'failed', error: error.message, progress: 0 });
-      addLog(`Task [${task.id.slice(-4)}] failed: ${error.message}`, 'error');
+      
+      let friendlyError = error.message || String(error);
+      const errLower = friendlyError.toLowerCase();
+      
+      if (errLower.includes('system error') || errLower.includes('system_error')) {
+        friendlyError = '云端渲染引擎遇到了过载或系统错误 (System Error)。由于上游生成节点偶尔会遇到突发连接中断或内存超出，建议您通过以下方式轻松解决该问题：\n1. 将模型切换为更稳定的专业 VIP 节点（例如 GPT Image 2 VIP）或切换至速度更快的 Banana 节点；\n2. 尝试降低分辨率（例如设为 1K 或 2K）；\n3. 稍等 2-3 秒，直接再次点击右侧的「生成图片」重新发起生成即可！';
+      } else if (
+        errLower.includes('fetch') || 
+        errLower.includes('network') || 
+        errLower.includes('load failed') || 
+        errLower.includes('failed to') || 
+        errLower.includes('typeerror') ||
+        error.name === 'TypeError'
+      ) {
+        friendlyError = '网络请求超时或受阻 (Failed to fetch)。由于高精度分辨率和高级模型计算耗时较长（通常在 40-50 秒），这很容易超出您的浏览器、移动端或外部网关的默认单次连接超时限制。请您放心！建议您通过以下方式即可瞬间解决生成难题：\n1. 将图片分辨率降低（例如设为 1K）；\n2. 将模型切换为生成更迅速的模型（例如 nano-banana 节点）；\n3. 将图片比例切换为 1:1 格式以大幅加快出图速度；\n4. 或者是稍等 3 秒直接再次点击「生成图片」重新快速发起！';
+      }
+      
+      updateTask({ status: 'failed', error: friendlyError, progress: 0 });
+      addLog(`Task [${task.id.slice(-4)}] failed: ${friendlyError}`, 'error');
     }
   };
 
