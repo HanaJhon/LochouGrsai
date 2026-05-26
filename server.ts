@@ -69,6 +69,7 @@ async function startServer() {
     });
   }, async (req: any, res) => {
     let heartbeatInterval: NodeJS.Timeout | null = null;
+
     try {
       const { 
         prompt, 
@@ -80,7 +81,7 @@ async function startServer() {
       } = req.body;
 
       // Resolve endpoint URL and key
-      let targetUrl = custom_api_url || process.env.EXTERNAL_API_URL || "https://grsaiapi.com/v1/api/generate";
+      let targetUrl = custom_api_url || process.env.EXTERNAL_API_URL || "https://grsai.dakka.com.cn/v1/api/generate";
       if (targetUrl) {
         targetUrl = targetUrl.replace(/\/$/, '');
         if (!targetUrl.includes('/v1/api/')) {
@@ -99,25 +100,6 @@ async function startServer() {
       logToFile(`Target endpoint: ${targetUrl}`);
       logToFile(`API Key length: ${apiKey ? apiKey.length : 0} (starts with Bearer: ${apiKey ? apiKey.startsWith('Bearer ') : false})`);
       logToFile(`Attached images: ${files.length}`);
-
-      // Configure headers for streaming/heartbeat to satisfy proxies and CDN buffering
-      res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Transfer-Encoding', 'chunked');
-      res.setHeader('X-Content-Type-Options', 'nosniff');
-      res.setHeader('X-Accel-Buffering', 'no'); // Disable NGINX content buffering
-      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-      res.setHeader('Connection', 'keep-alive');
-
-      // Flush headers immediately onto the socket to secure connection status
-      res.flushHeaders();
-
-      heartbeatInterval = setInterval(() => {
-        try {
-          res.write('\n'); // keep-alive heartbeat
-        } catch (err) {
-          console.error('[Server] Heartbeat write error:', err);
-        }
-      }, 10000);
 
       let response;
       try {
@@ -311,10 +293,6 @@ async function startServer() {
           timeout: 1800000, // 30 minutes timeout
         });
       } catch (postError: any) {
-        if (heartbeatInterval) {
-          clearInterval(heartbeatInterval);
-          heartbeatInterval = null;
-        }
         logToFile(`Axios connection/post error: ${postError.message}`);
         if (postError.response) {
           logToFile(`Axios response status: ${postError.response.status}`);
@@ -326,57 +304,27 @@ async function startServer() {
           errorMsg = "Remote generation timed out or connection was aborted.";
         }
         
-        const errPayload = {
+        return res.status(500).json({
           error: errorMsg,
           details: postError.message,
           code: postError.code
-        };
-
-        if (res.headersSent) {
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        } else {
-          res.status(500);
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        }
-        return;
-      }
-
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
+        });
       }
 
       logToFile(`Remote returned HTTP status: ${response.status}`);
       const bodySnippet = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
       logToFile(`Remote body snippet (first 600 chars): ${bodySnippet.slice(0, 600)}`);
 
-      // Clear/align headers if heartbeat never triggered
-      if (!res.headersSent) {
-        res.status(response.status);
-      }
-
       const contentType = String(response.headers['content-type'] || '');
 
       // Check if it's returning HTML error page
       if (contentType.includes('text/html') || bodySnippet.trim().startsWith('<!')) {
         logToFile(`Remote returned HTML content (likely an error or cloudflare challenge).`);
-        const errPayload = { 
+        return res.status(502).json({ 
           error: "Remote server returned HTML instead of JSON. This usually indicates an overloaded server, block, or wrong endpoint.",
           status: response.status,
           peek: bodySnippet.slice(0, 200)
-        };
-
-        if (res.headersSent) {
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        } else {
-          res.status(502);
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        }
-        return;
+        });
       }
 
       // Check for remote server HTTP error codes
@@ -390,32 +338,17 @@ async function startServer() {
           }
         }
         
-        const errPayload = {
-          error: `Remote API error [${response.status}]`,
-          details: errorData?.error || errorData?.details || errorData?.msg || errorData?.message || "Remote API call rejected",
+        const realError = errorData?.error || errorData?.details || errorData?.msg || errorData?.message || `Remote API error [${response.status}]`;
+        return res.status(response.status).json({
+          error: realError,
+          details: realError,
           ...errorData
-        };
-
-        if (res.headersSent) {
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        } else {
-          res.status(response.status);
-          res.write(JSON.stringify(errPayload));
-          res.end();
-        }
-        return;
+        });
       }
 
       // Successful response transmission
-      res.write(typeof response.data === 'string' ? response.data : JSON.stringify(response.data));
-      res.end();
-
+      return res.status(200).json(typeof response.data === 'string' ? JSON.parse(response.data) : response.data);
     } catch (error: any) {
-      if (heartbeatInterval) {
-        clearInterval(heartbeatInterval);
-        heartbeatInterval = null;
-      }
       logToFile(`Crash in proxy endpoint: ${error.message}`);
       
       let statusCode = 500;
@@ -426,24 +359,11 @@ async function startServer() {
         errorMsg = "Remote generation timed out or connection was aborted.";
       }
 
-      const errorPayload = {
+      return res.status(statusCode).json({
         error: errorMsg,
         details: error.message,
         code: error.code
-      };
-
-      if (res.headersSent) {
-        try {
-          res.write(JSON.stringify(errorPayload));
-          res.end();
-        } catch (e) {
-          console.error('[Server] Failed to write error to stream:', e);
-        }
-      } else {
-        res.status(statusCode);
-        res.write(JSON.stringify(errorPayload));
-        res.end();
-      }
+      });
     }
   });
 

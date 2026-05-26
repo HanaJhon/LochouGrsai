@@ -16,7 +16,9 @@ import {
   Key,
   Globe,
   Settings,
-  ExternalLink
+  ExternalLink,
+  AlertTriangle,
+  RefreshCw
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
@@ -74,8 +76,8 @@ const GPT_IMAGE_2_MODELS = [
 ];
 
 const GPT_NODES = [
-  { name: '全球节点', url: 'https://grsaiapi.com' },
-  { name: '国内节点', url: 'https://grsai.dakka.com.cn' },
+  { id: 'primary', name: '国内主力节点', url: 'https://grsai.dakka.com.cn' },
+  { id: 'backup', name: '国内备用节点', url: 'https://grsaiapi.com' },
 ];
 
 const RATIOS = [
@@ -136,7 +138,9 @@ export default function App() {
     images: [],
   });
 
-  const [gptNode, setGptNode] = useState(GPT_NODES[0].url);
+  const [selectedNodeId, setSelectedNodeId] = useState(GPT_NODES[0].id);
+  const activeNode = GPT_NODES.find(n => n.id === selectedNodeId) || GPT_NODES[0];
+  const gptNode = activeNode.url;
   const [previewImages, setPreviewImages] = useState<string[]>([]);
   const [isDragging, setIsDragging] = useState(false);
 
@@ -159,6 +163,7 @@ export default function App() {
   }, [activeTab, params.model]);
 
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [results, setResults] = useState<GenerationResult[]>([]);
   const [activeResultId, setActiveResultId] = useState<string | null>(null);
   const [previewImage, setPreviewImage] = useState<string | null>(null);
@@ -364,6 +369,8 @@ export default function App() {
     };
 
     setTasks(prev => [newTask, ...prev]);
+    setSelectedTaskId(taskId);
+    setActiveResultId(null);
     addLog(`Initiating generation task [${taskId.slice(-4)}] for model: ${params.model}...`, 'info');
     
     // Independent task execution
@@ -406,7 +413,7 @@ export default function App() {
       
       if (userApiKey) formData.append('custom_api_key', userApiKey);
       
-      const finalApiUrl = userApiUrl || (activeTab === 'gpt-image-2' ? gptNode : 'https://grsaiapi.com');
+      const finalApiUrl = userApiUrl || (activeTab === 'gpt-image-2' ? gptNode : 'https://grsai.dakka.com.cn');
       if (finalApiUrl) {
         let cleanedUrl = finalApiUrl.replace(/\/$/, '');
         if (!cleanedUrl.includes('/v1/api/')) {
@@ -441,26 +448,8 @@ export default function App() {
           });
 
           contentType = response.headers.get("content-type") || "";
-
-          // Actively consume the stream chunk by chunk from connection socket to prevent idle sweeps
-          if (response.body && typeof response.body.getReader === 'function') {
-            const reader = response.body.getReader();
-            const decoder = new TextDecoder("utf-8");
-            let done = false;
-            let accumulated = "";
-            
-            while (!done) {
-              const { value, done: readerDone } = await reader.read();
-              done = readerDone;
-              if (value) {
-                accumulated += decoder.decode(value, { stream: !done });
-              }
-            }
-            trimmedText = accumulated.trim();
-          } else {
-            const text = await response.text();
-            trimmedText = text.trim();
-          }
+          const text = await response.text();
+          trimmedText = text.trim();
 
           const isHtml = trimmedText.startsWith('<!doctype html') || trimmedText.startsWith('<!DOCTYPE html') || contentType.includes("text/html");
 
@@ -564,6 +553,22 @@ export default function App() {
       if (errLower.includes('system error') || errLower.includes('system_error')) {
         friendlyError = '云端渲染引擎遇到了过载或系统错误 (System Error)。由于上游生成节点偶尔会遇到突发连接中断或内存超出，建议您通过以下方式轻松解决该问题：\n1. 将模型切换为更稳定的专业 VIP 节点（例如 GPT Image 2 VIP）或切换至速度更快的 Banana 节点；\n2. 尝试降低分辨率（例如设为 1K 或 2K）；\n3. 稍等 2-3 秒，直接再次点击右侧的「生成图片」重新发起生成即可！';
       } else if (
+        errLower.includes('violate') || 
+        errLower.includes('policy') || 
+        errLower.includes('policies') || 
+        errLower.includes('合规') || 
+        errLower.includes('违法')
+      ) {
+        friendlyError = '您的输入提示词或生成的图像触发了云端安全合规过滤策略 (Content Policy Violation)。由于图像扩散模型（Diffusion Model）具有严格的安全过滤和内容审查机制，一些较为敏感、边缘或受版权保护的名词都可能使云端判定存在政策风险。\n请您放心！通常您只需要通过以下方式即可完美解决：\n1. 仔细微调或简化提示词（Prompt），避免使用露骨、容易产生歧义或包含特定现实人物/知名版权商标的词汇，改用更普遍、温和的替代描述；\n2. 将图像比例切换为标准的 1:1 格式，或者降低分辨率为 1K，减少多图层合成带来的复合违规误判；\n3. 尝试选择更具语意容忍度的模型（例如 GPT Image 2 节点）重新提交您的创作灵感！';
+      } else if (
+        errLower.includes('html instead of json') || 
+        errLower.includes('html content') || 
+        errLower.includes('cloud-flare') || 
+        errLower.includes('cloudflare') ||
+        errLower.includes('returned html')
+      ) {
+        friendlyError = '云端渲染节点当前负载较重，或因瞬间网络拥堵未能正确响应该格式请求 (HTML Gateway Challenge)。这通常指上游生成接口临时超载排队、受到云关防火墙拦截挑战或处于短时维护重启中。\n请您放心！建议您按照以下方法处理：\n1. 稍等 3-5 秒，直接再次点击右侧的「生成图片」重新快速尝试；\n2. 将画面分辨率调低（例如设为 1K 或 2K）以极大缩短接口处理反应时间，能极大提高单次连接成功概率；\n3. 随意切换至其他极速生成节点（例如拥有极速引擎的 Banana Fast 节点）即可完美避开当前拥堵链路！';
+      } else if (
         errLower.includes('fetch') || 
         errLower.includes('network') || 
         errLower.includes('load failed') || 
@@ -571,12 +576,41 @@ export default function App() {
         errLower.includes('typeerror') ||
         error.name === 'TypeError'
       ) {
-        friendlyError = '网络请求超时或受阻 (Failed to fetch)。由于高精度分辨率和高级模型计算耗时较长（通常在 40-50 秒），这很容易超出您的浏览器、移动端或外部网关的默认单次连接超时限制。请您放心！建议您通过以下方式即可瞬间解决生成难题：\n1. 将图片分辨率降低（例如设为 1K）；\n2. 将模型切换为生成更迅速的模型（例如 nano-banana 节点）；\n3. 将图片比例切换为 1:1 格式以大幅加快出图速度；\n4. 或者是稍等 3 秒直接再次点击「生成图片」重新快速发起！';
+        friendlyError = '网络请求超时或受阻 (Failed to fetch)。由于高精度分辨率 and 高级模型计算耗时较长（通常在 40-50 秒），这很容易超出您的浏览器、移动端或外部网关的默认单次连接超时限制。请您放心！建议您通过以下方式即可瞬间解决生成难题：\n1. 将图片分辨率降低（例如设为 1K）；\n2. 将模型切换为生成更迅速的模型（例如 nano-banana 节点）；\n3. 将图片比例切换为 1:1 格式以大幅加快出图速度；\n4. 或者是稍等 3 秒直接再次点击「生成图片」重新快速发起！';
       }
       
       updateTask({ status: 'failed', error: friendlyError, progress: 0 });
       addLog(`Task [${task.id.slice(-4)}] failed: ${friendlyError}`, 'error');
     }
+  };
+
+  const getActivePreviewElement = () => {
+    // 1. Find the selected task or fallback to the latest task
+    const targetTask = tasks.find(t => t.id === selectedTaskId) || tasks[0];
+
+    if (!targetTask) {
+      // No tasks exist at all, check if we have any prior history loaded from cache
+      const activeResult = results.find(r => r.id === activeResultId) || results[0];
+      if (activeResult) {
+        return { type: 'completed' as const, url: activeResult.url, task: null };
+      }
+      return { type: 'empty' as const };
+    }
+
+    if (targetTask.status === 'completed') {
+      const result = results.find(r => r.id === targetTask.id) || results.find(r => r.url === targetTask.resultUrl);
+      return { type: 'completed' as const, url: result?.url || targetTask.resultUrl || '', task: targetTask };
+    }
+
+    if (targetTask.status === 'processing') {
+      return { type: 'processing' as const, progress: targetTask.progress, task: targetTask };
+    }
+
+    if (targetTask.status === 'failed') {
+      return { type: 'failed' as const, error: targetTask.error || 'Unknown Error', task: targetTask };
+    }
+
+    return { type: 'empty' as const };
   };
 
   const isGenerating = tasks.some(t => t.status === 'processing');
@@ -715,11 +749,11 @@ export default function App() {
                 <div className="grid grid-cols-2 gap-2">
                   {GPT_NODES.map((node) => (
                     <button
-                      key={node.url}
-                      onClick={() => setGptNode(node.url)}
+                      key={node.id}
+                      onClick={() => setSelectedNodeId(node.id)}
                       className={cn(
                         "text-[10px] py-2 rounded-lg border transition-all",
-                        gptNode === node.url 
+                        selectedNodeId === node.id 
                           ? "bg-indigo-600/10 border-indigo-500/50 text-white" 
                           : "bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-600"
                       )}
@@ -785,10 +819,29 @@ export default function App() {
                   </div>
                 ) : (
                   tasks.map(task => (
-                    <div key={task.id} className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-2">
+                    <div 
+                      key={task.id} 
+                      onClick={() => {
+                        setSelectedTaskId(task.id);
+                        if (task.status === 'completed') {
+                          const result = results.find(r => r.url === task.resultUrl || r.id === task.id);
+                          if (result) {
+                            setActiveResultId(result.id);
+                          } else if (task.resultUrl) {
+                            setActiveResultId(task.id);
+                          }
+                        } else {
+                          setActiveResultId(null);
+                        }
+                      }}
+                      className={cn(
+                        "bg-slate-950 border rounded-xl p-3 space-y-2 cursor-pointer transition-all",
+                        selectedTaskId === task.id ? "border-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.15)]" : "border-slate-800 hover:border-slate-700"
+                      )}
+                    >
                       <div className="flex justify-between items-start gap-2">
                         <div className="flex-1 min-w-0">
-                          <p className="text-[10px] text-slate-300 font-bold truncate">{task.prompt}</p>
+                          <p className={`text-[10px] font-bold truncate ${selectedTaskId === task.id ? "text-indigo-300" : "text-slate-300"}`}>{task.prompt}</p>
                           <p className="text-[8px] text-slate-500 font-mono uppercase mt-0.5">{task.model} | {task.id.slice(-4)}</p>
                         </div>
                         <div className={cn(
@@ -805,9 +858,9 @@ export default function App() {
                         <div className="space-y-1">
                           <div className="h-1 bg-slate-800 rounded-full overflow-hidden">
                             <motion.div 
-                              className="h-full bg-indigo-500" 
-                              initial={{ width: 0 }}
-                              animate={{ width: `${task.progress}%` }}
+                               className="h-full bg-indigo-500" 
+                               initial={{ width: 0 }}
+                               animate={{ width: `${task.progress}%` }}
                             />
                           </div>
                           <div className="flex justify-between text-[8px] font-mono text-slate-500">
@@ -818,9 +871,10 @@ export default function App() {
                       )}
 
                       {task.status === 'completed' && (
-                        <div className="flex gap-2">
+                        <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                           <button 
                             onClick={() => {
+                              setSelectedTaskId(task.id);
                               const result = results.find(r => r.url === task.resultUrl || r.id === task.id);
                               if (result) {
                                 setActiveResultId(result.id);
@@ -986,14 +1040,75 @@ export default function App() {
             <div className="aspect-square md:aspect-video bg-slate-900 border border-slate-800 rounded-[32px] overflow-hidden relative group">
               <div className="absolute inset-0 flex items-center justify-center">
                 {(() => {
-                  const activeResult = results.find(r => r.id === activeResultId) || results[0];
-                  if (activeResult) {
-                    return <img src={activeResult.url} alt="Generated" className="w-full h-full object-contain" />;
+                  const preview = getActivePreviewElement();
+                  if (preview.type === 'completed' && preview.url) {
+                    return <img src={preview.url} alt="Generated" className="w-full h-full object-contain" />;
                   }
+                  if (preview.type === 'processing') {
+                    return (
+                      <div className="text-center px-6 space-y-4">
+                        <div className="w-16 h-16 border-4 border-slate-800 border-t-indigo-500 rounded-full mx-auto mb-2 animate-spin"></div>
+                        <div className="space-y-1">
+                          <p className="text-indigo-400 text-xs font-bold font-mono tracking-widest">{preview.task?.progress || 0}% RENDERING ({preview.task?.model})</p>
+                          <p className="text-slate-500 text-[10px] font-sans truncate max-w-md mx-auto">"{preview.task?.prompt}"</p>
+                        </div>
+                      </div>
+                    );
+                  }
+                  if (preview.type === 'failed') {
+                    return (
+                      <div className="text-center px-6 py-6 max-w-xl mx-auto space-y-4 overflow-y-auto max-h-[90%] scrollbar-thin scrollbar-thumb-red-900/40">
+                        <div className="w-10 h-10 bg-red-950/40 border border-red-500/20 rounded-full flex items-center justify-center mx-auto text-red-500">
+                          <AlertTriangle className="w-5 h-5" />
+                        </div>
+                        <h3 className="text-red-400 font-bold text-xs tracking-wider uppercase">生成请求中断 (Generation Interrupted)</h3>
+                        <div className="bg-red-950/25 border border-red-900/45 p-3.5 rounded-xl text-left">
+                          <p className="text-[11px] text-red-300 font-sans leading-relaxed whitespace-pre-line">{preview.error}</p>
+                        </div>
+                        <div className="flex gap-2 justify-center">
+                          <button 
+                            onClick={() => {
+                              if (preview.task) {
+                                setParams({ ...preview.task.params });
+                                addLog(`Restored parameters from task [${preview.task.id.slice(-4)}].`, 'info');
+                              }
+                            }}
+                            className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold rounded-lg transition-all uppercase tracking-wider"
+                          >
+                            恢复参数
+                          </button>
+                          <button 
+                            onClick={async () => {
+                              if (preview.task) {
+                                const taskId = `task-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+                                const newTask: Task = {
+                                  id: taskId,
+                                  prompt: preview.task.params.prompt,
+                                  model: preview.task.params.model,
+                                  status: 'processing' as const,
+                                  progress: 0,
+                                  timestamp: Date.now(),
+                                  params: { ...preview.task.params },
+                                };
+                                setTasks(prev => [newTask, ...prev]);
+                                setSelectedTaskId(taskId);
+                                addLog(`Retrying execution task [${taskId.slice(-4)}]...`, 'info');
+                                executeTask(newTask);
+                              }
+                            }}
+                            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold rounded-lg shadow-lg shadow-indigo-950/50 transition-all flex items-center gap-1.5 uppercase tracking-wider"
+                          >
+                            <RefreshCw className="w-3 h-3" /> 立即重试
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  }
+                  
                   return (
                     <div className="text-center px-6">
-                      <div className="w-20 h-20 border-4 border-slate-800 border-t-indigo-500 rounded-full mx-auto mb-6 animate-spin" style={{ animationDuration: isGenerating ? '1s' : '0s', opacity: isGenerating ? 1 : 0.2 }}></div>
-                      <p className="text-slate-600 text-sm italic font-mono uppercase tracking-widest">{isGenerating ? '正在请求算力资源...' : '等待任务输入...'}</p>
+                      <div className="w-16 h-16 border-4 border-slate-800 border-t-indigo-500 rounded-full mx-auto mb-4 animate-spin" style={{ animationDuration: '0s', opacity: 0.2 }}></div>
+                      <p className="text-slate-600 text-xs italic font-mono uppercase tracking-widest">等待任务输入...</p>
                     </div>
                   );
                 })()}
@@ -1021,17 +1136,17 @@ export default function App() {
               </AnimatePresence>
               
               {(() => {
-                const activeResult = results.find(r => r.id === activeResultId) || results[0];
-                if (activeResult) {
+                const preview = getActivePreviewElement();
+                if (preview.type === 'completed' && preview.url) {
                   return (
                     <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-slate-950 to-transparent">
                       <div className="flex justify-between items-end">
                         <div>
                           <span className="px-2 py-1 bg-indigo-500 text-[10px] font-bold rounded text-white mb-2 inline-block">READY TO RENDER</span>
-                          <p className="text-slate-400 text-[10px] font-mono tracking-widest uppercase">LATENCY: ACTIVE • ID: {activeResult.id.slice(0, 8)}</p>
+                          <p className="text-slate-400 text-[10px] font-mono tracking-widest uppercase">LATENCY: ACTIVE • ID: {preview.task ? preview.task.id.slice(0, 8) : 'CACHE'}</p>
                         </div>
                         <button 
-                          onClick={() => window.open(activeResult.url, '_blank')}
+                          onClick={() => window.open(preview.url, '_blank')}
                           className="p-3 bg-white/10 hover:bg-white/20 backdrop-blur-md rounded-xl transition-all"
                         >
                           <Download className="w-5 h-5 text-white" />
@@ -1240,7 +1355,7 @@ export default function App() {
                       type="text"
                       value={userApiUrl}
                       onChange={(e) => setUserApiUrl(e.target.value)}
-                      placeholder="https://grsaiapi.com/v1/api/generate"
+                      placeholder="https://grsai.dakka.com.cn/v1/api/generate"
                       className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-sm focus:border-indigo-500 outline-none transition-all text-indigo-100 placeholder:text-slate-700 font-mono"
                     />
                     <p className="text-[9px] text-slate-600 font-mono italic">留空则使用系统默认节点</p>
